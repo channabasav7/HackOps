@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -23,6 +25,8 @@ def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
         settings = get_settings()
+        if settings.sentinel_offline_mode or not settings.supabase_db_url:
+            raise RuntimeError("Database engine requested in offline mode.")
         url = _build_async_url(settings.supabase_db_url)
         _engine = create_async_engine(
             url,
@@ -42,8 +46,17 @@ AsyncSessionLocal = sessionmaker(  # type: ignore[call-overload]
 )
 
 
-async def get_db() -> AsyncSession:  # type: ignore[return]
-    """FastAPI dependency — yields an async DB session."""
+async def get_db() -> AsyncIterator[AsyncSession | None]:
+    """
+    FastAPI dependency — yields an async DB session.
+
+    In offline mode, yields None so routes can fall back to the in-memory store.
+    """
+    settings = get_settings()
+    if settings.sentinel_offline_mode or not settings.supabase_db_url:
+        yield None
+        return
+
     engine = get_engine()
     async with AsyncSession(engine, expire_on_commit=False) as session:
         yield session

@@ -3,9 +3,9 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { ThreatAnalysis } from "@/lib/types";
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // Message types mirroring the backend broadcast schema
-// ─────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 
 export interface WsConnectedMessage {
   type: "CONNECTED";
@@ -49,18 +49,18 @@ export type WsMessage =
   | WsHeartbeatMessage
   | WsIngestMessage;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Utility — derive ws:// or wss:// URL from the API base URL
-// ─────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
+// Utility - derive ws:// or wss:// URL from the API base URL
+// ----------------------------------------------------------------------------
 
 export function getWsUrl(apiUrl: string, role: "sender" | "receiver"): string {
   const base = apiUrl.replace(/^http/, (m) => (m === "https" ? "wss" : "ws"));
   return `${base}/api/ws?role=${role}`;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // Hook
-// ─────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 
 interface UseWebSocketOptions {
   apiUrl: string;
@@ -152,7 +152,7 @@ export function useWebSocket({
 
       // Sync presence counts from any message that carries them
       // (CONNECTED, STATUS, and HEARTBEAT all now carry these)
-      const m = msg as Record<string, unknown>;
+      const m = msg as unknown as Record<string, unknown>;
       if (typeof m.receiver_count === "number") setReceiverCount(m.receiver_count as number);
       if (typeof m.sender_count === "number") setSenderCount(m.sender_count as number);
       if (typeof m.connected_clients === "number") setTotalClients(m.connected_clients as number);

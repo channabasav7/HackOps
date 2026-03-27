@@ -1384,6 +1384,7 @@ export function ReceiverDashboard({ onSignOut }: { onSignOut?: () => void } = {}
 
   // ── Fallback: Supabase Realtime (fires if WS missed the row) ───────────────
   useEffect(() => {
+    if (!supabase) return;
     const channel = supabase
       .channel("sentinel-chat-logs-rx")
       .on(
@@ -1397,7 +1398,11 @@ export function ReceiverDashboard({ onSignOut }: { onSignOut?: () => void } = {}
         }
       )
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    return () => {
+      if (supabase) {
+        supabase.removeChannel(channel);
+      }
+    };
   }, [pushEntry]);
 
   const threats = entries.filter((e) => e.threat_flag);

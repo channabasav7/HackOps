@@ -37,6 +37,7 @@ from core.crypto_engine import (
     generate_ngram_hashes,
 )
 from models.database import get_db
+from models import local_store
 
 logger = logging.getLogger("sentinel.monitor")
 
@@ -207,8 +208,10 @@ async def get_connections() -> dict:
     description="Returns ok: true if the backend can reach Supabase PostgreSQL; otherwise ok: false with the error message.",
 )
 async def check_db(
-    db: Annotated[AsyncSession, Depends(get_db)],
+    db: Annotated[AsyncSession | None, Depends(get_db)],
 ) -> dict:
+    if db is None:
+        return {"ok": False, "error": "Offline mode: no database configured."}
     try:
         await db.execute(text("SELECT 1"))
         return {"ok": True, "message": "Database connection successful."}
@@ -317,7 +320,7 @@ _engine_cache: ThreatDetectionEngine | None = None
 
 
 async def _load_detection_engine(
-    db: AsyncSession,
+    db: AsyncSession | None,
     settings: Settings,
     aes_key: bytes,
 ) -> ThreatDetectionEngine:
@@ -328,10 +331,16 @@ async def _load_detection_engine(
     """
     engine = ThreatDetectionEngine(threshold=settings.threat_match_threshold)
 
-    result = await db.execute(
-        text("SELECT operation_name, bloom_filter_data FROM public.watchlist")
-    )
-    rows = result.mappings().all()
+    if db is None:
+        rows = await local_store.get_watchlist_rows()
+    else:
+        try:
+            result = await db.execute(
+                text("SELECT operation_name, bloom_filter_data FROM public.watchlist")
+            )
+            rows = result.mappings().all()
+        except SQLAlchemyOperationalError:
+            rows = await local_store.get_watchlist_rows()
 
     if rows:
         engine.load_watchlist_from_db_rows(
@@ -414,7 +423,7 @@ def _build_demo_detection_engine(settings: Settings, aes_key: bytes) -> ThreatDe
 )
 async def ingest_chat(
     payload: ChatIngestRequest,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    db: Annotated[AsyncSession | None, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ChatIngestResponse:
     # ── 1. Derive cryptographic material ──────────────────────────────────────
@@ -465,68 +474,61 @@ async def ingest_chat(
                 max_fpr,
             )
 
-        try:
-            await db.execute(
-                text(
-                    """
-                    INSERT INTO public.chat_logs
-                        (id, unit_id, timestamp, encrypted_payload,
-                         threat_flag, match_count, ngram_hash_sample, ngram_hashes)
-                    VALUES
-                        (:id, :unit_id, :timestamp, :encrypted_payload,
-                         :threat_flag, :match_count, :ngram_hash_sample, :ngram_hashes)
-                    """
-                ),
-                {
-                    "id": log_id,
-                    "unit_id": payload.unit_id,
-                    "timestamp": timestamp,
-                    "encrypted_payload": encrypted_payload,
-                    "threat_flag": is_threat,
-                    "match_count": match_count,
-                    "ngram_hash_sample": hash_sample,
-                    "ngram_hashes": ngram_hashes,
-                },
+        if db is None:
+            database_persisted = False
+            await local_store.upsert_chat_log(
+                local_store.LocalChatLog(
+                    id=log_id,
+                    unit_id=payload.unit_id,
+                    timestamp=timestamp,
+                    encrypted_payload=encrypted_payload,
+                    threat_flag=is_threat,
+                    match_count=match_count,
+                    ngram_hash_sample=hash_sample,
+                    ngram_hashes=ngram_hashes,
+                )
             )
-            await db.commit()
-        except Exception as exc:
-            await db.rollback()
-            if "ngram_hashes" in str(exc):
-                try:
-                    await db.execute(
-                        text(
-                            """
-                            INSERT INTO public.chat_logs
-                                (id, unit_id, timestamp, encrypted_payload,
-                                 threat_flag, match_count, ngram_hash_sample)
-                            VALUES
-                                (:id, :unit_id, :timestamp, :encrypted_payload,
-                                 :threat_flag, :match_count, :ngram_hash_sample)
-                            """
-                        ),
-                        {
-                            "id": log_id,
-                            "unit_id": payload.unit_id,
-                            "timestamp": timestamp,
-                            "encrypted_payload": encrypted_payload,
-                            "threat_flag": is_threat,
-                            "match_count": match_count,
-                            "ngram_hash_sample": hash_sample,
-                        },
+        else:
+            try:
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO public.chat_logs
+                            (id, unit_id, timestamp, encrypted_payload,
+                             threat_flag, match_count, ngram_hash_sample, ngram_hashes)
+                        VALUES
+                            (:id, :unit_id, :timestamp, :encrypted_payload,
+                             :threat_flag, :match_count, :ngram_hash_sample, :ngram_hashes)
+                        """
+                    ),
+                    {
+                        "id": log_id,
+                        "unit_id": payload.unit_id,
+                        "timestamp": timestamp,
+                        "encrypted_payload": encrypted_payload,
+                        "threat_flag": is_threat,
+                        "match_count": match_count,
+                        "ngram_hash_sample": hash_sample,
+                        "ngram_hashes": ngram_hashes,
+                    },
+                )
+                await db.commit()
+            except Exception as exc:
+                await db.rollback()
+                # If Supabase isn't set up (missing tables/migrations), fall back to local store.
+                logger.warning("DB write failed; falling back to local store: %s", exc)
+                database_persisted = False
+                await local_store.upsert_chat_log(
+                    local_store.LocalChatLog(
+                        id=log_id,
+                        unit_id=payload.unit_id,
+                        timestamp=timestamp,
+                        encrypted_payload=encrypted_payload,
+                        threat_flag=is_threat,
+                        match_count=match_count,
+                        ngram_hash_sample=hash_sample,
+                        ngram_hashes=ngram_hashes,
                     )
-                    await db.commit()
-                except Exception as e2:
-                    await db.rollback()
-                    logger.error("Database write failure: %s", e2)
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="Persistence layer unavailable",
-                    )
-            else:
-                logger.error("Database write failure: %s", exc)
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Persistence layer unavailable",
                 )
 
     except SQLAlchemyOperationalError as exc:
@@ -542,6 +544,40 @@ async def ingest_chat(
         intercepting_nodes = result.intercepting_nodes
         if is_threat:
             logger.warning("THREAT DETECTED (demo) | unit=%s | matches=%d | severity=%s", payload.unit_id, match_count, severity)
+        await local_store.upsert_chat_log(
+            local_store.LocalChatLog(
+                id=log_id,
+                unit_id=payload.unit_id,
+                timestamp=timestamp,
+                encrypted_payload=encrypted_payload,
+                threat_flag=is_threat,
+                match_count=match_count,
+                ngram_hash_sample=hash_sample,
+                ngram_hashes=ngram_hashes,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Ingest persistence failed; using local store: %s", exc)
+        database_persisted = False
+        detection_engine = _build_demo_detection_engine(settings, aes_key)
+        result = detection_engine.analyze(ngram_hashes)
+        is_threat = result.is_threat
+        match_count = result.total_matches
+        max_fpr = result.max_false_positive_rate
+        severity = result.severity
+        intercepting_nodes = result.intercepting_nodes
+        await local_store.upsert_chat_log(
+            local_store.LocalChatLog(
+                id=log_id,
+                unit_id=payload.unit_id,
+                timestamp=timestamp,
+                encrypted_payload=encrypted_payload,
+                threat_flag=is_threat,
+                match_count=match_count,
+                ngram_hash_sample=hash_sample,
+                ngram_hashes=ngram_hashes,
+            )
+        )
 
     # ── Simulate attack override (sender toggle) ──────────────────────────────
     # When simulate_attack=True the real Bloom-filter result is discarded and a
@@ -663,19 +699,32 @@ class DecryptResponse(BaseModel):
 )
 async def decrypt_at_receiver(
     payload: DecryptRequest,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    db: Annotated[AsyncSession | None, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> DecryptResponse:
     aes_key = derive_key(settings.aes_master_key)
-    result = await db.execute(
-        text(
-            "SELECT id, unit_id, timestamp, encrypted_payload FROM public.chat_logs WHERE id = :id"
-        ),
-        {"id": payload.log_id},
-    )
-    row = result.mappings().first()
-    if not row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log not found")
+    row = None
+    if db is not None:
+        try:
+            result = await db.execute(
+                text(
+                    "SELECT id, unit_id, timestamp, encrypted_payload FROM public.chat_logs WHERE id = :id"
+                ),
+                {"id": payload.log_id},
+            )
+            row = result.mappings().first()
+        except Exception:
+            row = None
+    if row is None:
+        local = await local_store.get_chat_log(payload.log_id)
+        if local is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log not found")
+        row = {
+            "id": local.id,
+            "unit_id": local.unit_id,
+            "timestamp": local.timestamp,
+            "encrypted_payload": local.encrypted_payload,
+        }
     try:
         plaintext = decrypt_message(row["encrypted_payload"], aes_key)
     except Exception as exc:
@@ -716,7 +765,7 @@ class SearchEncryptedResponse(BaseModel):
 )
 async def search_encrypted(
     payload: SearchEncryptedRequest,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    db: Annotated[AsyncSession | None, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> SearchEncryptedResponse:
     query_hashes = generate_ngram_hashes(payload.query, settings.hmac_secret, n=3)
@@ -727,29 +776,41 @@ async def search_encrypted(
             message="No tokens generated for query.",
             matches=[],
         )
-    try:
-        result = await db.execute(
-            text(
-                """
-                SELECT id, unit_id, timestamp, encrypted_payload, threat_flag, match_count
-                FROM public.chat_logs
-                WHERE ngram_hashes && :hashes
-                ORDER BY timestamp DESC
-                LIMIT 50
-                """
-            ),
-            {"hashes": query_hashes},
-        )
-        rows = result.mappings().all()
-    except Exception as exc:
-        if "ngram_hashes" in str(exc):
-            return SearchEncryptedResponse(
-                query=payload.query,
-                trapdoor_hashes_count=len(query_hashes),
-                message="SSE search requires ngram_hashes column. Run backend/models/migration_ngram_hashes.sql in Supabase.",
-                matches=[],
+    rows: list[dict] = []
+    if db is not None:
+        try:
+            result = await db.execute(
+                text(
+                    """
+                    SELECT id, unit_id, timestamp, encrypted_payload, threat_flag, match_count
+                    FROM public.chat_logs
+                    WHERE ngram_hashes && :hashes
+                    ORDER BY timestamp DESC
+                    LIMIT 50
+                    """
+                ),
+                {"hashes": query_hashes},
             )
-        raise
+            rows = [dict(r) for r in result.mappings().all()]
+        except Exception:
+            rows = []
+
+    if not rows:
+        logs = await local_store.list_chat_logs()
+        q = set(query_hashes)
+        for log in logs:
+            if q.intersection(log.ngram_hashes):
+                rows.append(
+                    {
+                        "id": log.id,
+                        "unit_id": log.unit_id,
+                        "timestamp": log.timestamp,
+                        "encrypted_payload": log.encrypted_payload,
+                        "threat_flag": log.threat_flag,
+                        "match_count": log.match_count,
+                    }
+                )
+        rows = rows[:50]
 
     matches = [
         {
@@ -795,7 +856,7 @@ class WatchlistAddResponse(BaseModel):
 )
 async def add_watchlist_entry(
     payload: WatchlistAddRequest,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    db: Annotated[AsyncSession | None, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> WatchlistAddResponse:
     aes_key = derive_key(settings.aes_master_key)
@@ -814,28 +875,28 @@ async def add_watchlist_entry(
     fpr = entry.bloom_filter.estimated_false_positive_rate
     wl_id = str(uuid4())
 
-    try:
-        await db.execute(
-            text(
-                """
-                INSERT INTO public.watchlist (id, operation_name, bloom_filter_data)
-                VALUES (:id, :operation_name, :bloom_filter_data)
-                """
-            ),
-            {
-                "id": wl_id,
-                "operation_name": entry.operation_name_encrypted,
-                "bloom_filter_data": bloom_bytes,
-            },
-        )
-        await db.commit()
-    except Exception as exc:
-        await db.rollback()
-        logger.error("Watchlist write failure: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to persist watchlist entry",
-        )
+    if db is None:
+        await local_store.add_watchlist_row(entry.operation_name_encrypted, bloom_bytes)
+    else:
+        try:
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO public.watchlist (id, operation_name, bloom_filter_data)
+                    VALUES (:id, :operation_name, :bloom_filter_data)
+                    """
+                ),
+                {
+                    "id": wl_id,
+                    "operation_name": entry.operation_name_encrypted,
+                    "bloom_filter_data": bloom_bytes,
+                },
+            )
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("Watchlist write failed; persisting locally: %s", exc)
+            await local_store.add_watchlist_row(entry.operation_name_encrypted, bloom_bytes)
 
     return WatchlistAddResponse(
         watchlist_id=wl_id,
@@ -875,35 +936,50 @@ class ThreatFeedResponse(BaseModel):
                 "Severity is computed from match_count (deterministic).",
 )
 async def get_threats(
-    db: Annotated[AsyncSession, Depends(get_db)],
+    db: Annotated[AsyncSession | None, Depends(get_db)],
     limit: int = 100,
 ) -> ThreatFeedResponse:
-    try:
-        count_result = await db.execute(text("SELECT COUNT(*) FROM public.chat_logs"))
-        total_intercepted = count_result.scalar() or 0
+    rows: list[dict] = []
+    total_intercepted = 0
+    if db is not None:
+        try:
+            count_result = await db.execute(text("SELECT COUNT(*) FROM public.chat_logs"))
+            total_intercepted = count_result.scalar() or 0
 
-        result = await db.execute(
-            text(
-                """
-                SELECT id, unit_id, timestamp, encrypted_payload,
-                       match_count, ngram_hash_sample
-                FROM public.chat_logs
-                WHERE threat_flag = true
-                ORDER BY timestamp DESC
-                LIMIT :lim
-                """
-            ),
-            {"lim": limit},
-        )
-        rows = result.mappings().all()
-    except Exception as exc:
-        logger.warning("Threat feed query failed: %s", exc)
-        return ThreatFeedResponse(
-            total_intercepted=0,
-            total_threats=0,
-            threats=[],
-            severity_breakdown={},
-        )
+            result = await db.execute(
+                text(
+                    """
+                    SELECT id, unit_id, timestamp, encrypted_payload,
+                           match_count, ngram_hash_sample
+                    FROM public.chat_logs
+                    WHERE threat_flag = true
+                    ORDER BY timestamp DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"lim": limit},
+            )
+            rows = [dict(r) for r in result.mappings().all()]
+        except Exception:
+            rows = []
+
+    if not rows:
+        logs = await local_store.list_chat_logs()
+        total_intercepted = len(logs)
+        for log in logs:
+            if not log.threat_flag:
+                continue
+            rows.append(
+                {
+                    "id": log.id,
+                    "unit_id": log.unit_id,
+                    "timestamp": log.timestamp,
+                    "encrypted_payload": log.encrypted_payload,
+                    "match_count": log.match_count,
+                    "ngram_hash_sample": log.ngram_hash_sample,
+                }
+            )
+        rows = rows[:limit]
 
     severity_counts: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     threats: list[ThreatEntry] = []

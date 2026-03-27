@@ -3,7 +3,7 @@ import "./globals.css";
 import { AuthProvider } from "./auth-context";
 
 export const metadata: Metadata = {
-  title: "Project Sentinel — Zero-Exposure Threat Detection",
+  title: "Project Sentinel - Zero-Exposure Threat Detection",
   description:
     "Military-grade encrypted communications threat detection system. " +
     "Powered by Searchable Symmetric Encryption and Bloom Filters.",

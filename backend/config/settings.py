@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 from pydantic import field_validator
+from pydantic import model_validator
 
 
 class Settings(BaseSettings):
@@ -10,9 +11,11 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    supabase_db_url: str
-    supabase_url: str
-    supabase_service_role_key: str
+    sentinel_offline_mode: bool = False
+
+    supabase_db_url: str | None = None
+    supabase_url: str | None = None
+    supabase_service_role_key: str | None = None
 
     aes_master_key: str  # 64-char hex string → 32 bytes
     hmac_secret: str
@@ -44,6 +47,30 @@ class Settings(BaseSettings):
         if not secret or "replace-me" in secret.lower():
             raise ValueError("HMAC_SECRET is missing or still a placeholder.")
         return secret
+
+    @model_validator(mode="after")
+    def validate_required_services(self) -> "Settings":
+        """
+        In normal mode, Supabase settings are required.
+        In offline mode, the backend runs with an in-memory store and does not
+        require Supabase connectivity.
+        """
+        if self.sentinel_offline_mode:
+            return self
+
+        missing = []
+        if not (self.supabase_db_url and self.supabase_db_url.strip()):
+            missing.append("SUPABASE_DB_URL")
+        if not (self.supabase_url and self.supabase_url.strip()):
+            missing.append("SUPABASE_URL")
+        if not (self.supabase_service_role_key and self.supabase_service_role_key.strip()):
+            missing.append("SUPABASE_SERVICE_ROLE_KEY")
+        if missing:
+            raise ValueError(
+                "Missing required environment variables: " + ", ".join(missing) + ". "
+                "Either configure Supabase credentials, or set SENTINEL_OFFLINE_MODE=true."
+            )
+        return self
 
 
 @lru_cache
