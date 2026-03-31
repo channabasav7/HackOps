@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     )
 
     sentinel_offline_mode: bool = False
+    sentinel_env: str = "development"
 
     supabase_db_url: str | None = None
     supabase_url: str | None = None
@@ -27,6 +28,12 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-production-sentinel-jwt-secret"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24  # 24 hours
+
+    cors_origins: str | None = None
+    cors_allow_origin_regex: str | None = r"https://.*\.vercel\.app"
+
+    auth_rate_limit_max_attempts: int = 5
+    auth_rate_limit_window_seconds: int = 60
 
     @field_validator("aes_master_key")
     @classmethod
@@ -48,6 +55,39 @@ class Settings(BaseSettings):
             raise ValueError("HMAC_SECRET is missing or still a placeholder.")
         return secret
 
+    @field_validator("sentinel_env")
+    @classmethod
+    def validate_sentinel_env(cls, v: str) -> str:
+        env = v.strip().lower()
+        allowed = {"development", "staging", "production"}
+        if env not in allowed:
+            raise ValueError("SENTINEL_ENV must be one of: development, staging, production.")
+        return env
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def validate_jwt_secret(cls, v: str) -> str:
+        secret = v.strip()
+        if len(secret) < 32:
+            raise ValueError("JWT_SECRET must be at least 32 characters.")
+        lowered = secret.lower()
+        weak_markers = ("change-me", "your_", "placeholder")
+        if any(marker in lowered for marker in weak_markers):
+            raise ValueError("JWT_SECRET appears to be a placeholder; set a strong random secret.")
+        return secret
+
+    @field_validator("auth_rate_limit_max_attempts", "auth_rate_limit_window_seconds")
+    @classmethod
+    def validate_positive_ints(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("Rate-limit settings must be >= 1.")
+        return v
+
+    def get_cors_origins(self, default: list[str] | None = None) -> list[str]:
+        if self.cors_origins:
+            return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        return list(default or [])
+
     @model_validator(mode="after")
     def validate_required_services(self) -> "Settings":
         """
@@ -55,6 +95,9 @@ class Settings(BaseSettings):
         In offline mode, the backend runs with an in-memory store and does not
         require Supabase connectivity.
         """
+        if self.sentinel_env == "production" and not self.cors_origins:
+            raise ValueError("CORS_ORIGINS must be explicitly set in production.")
+
         if self.sentinel_offline_mode:
             return self
 

@@ -10,3 +10,4 @@ python-dotenv
 httpx
 bcrypt
 pyjwt
+pytest
